@@ -538,8 +538,30 @@ def is_irrelevant(kw, tool_name):
         'how to contact', 'how to cancel subscription',
         'how to get a job', 'salary', 'hiring', 'career',
         'how to pronounce', 'pronunciation',
+        'template', 'templates', 'free download',
+        'alternative', 'alternatives', 'pricing', 'price', 'cost',
+        'review', 'reviews', 'reddit', 'quora',
+        'login', 'log in', 'sign in', 'sign up',
+        'not working', 'error', 'issue', 'problem', 'bug',
+        'announcement', 'release note', 'changelog',
+        'coupon', 'discount', 'promo',
     ]
-    return any(p in kw_lower for p in irrelevant_patterns)
+    if any(p in kw_lower for p in irrelevant_patterns):
+        return True
+
+    if _is_non_english(kw):
+        return True
+
+    return False
+
+
+def _is_non_english(text):
+    """Detect non-English keywords by checking for non-ASCII letter ratio."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return False
+    non_ascii = sum(1 for c in letters if ord(c) > 127)
+    return non_ascii / len(letters) > 0.3
 
 
 # ── Core Pipeline ────────────────────────────────────────────────────────────
@@ -846,34 +868,211 @@ def write_tool_csv(tool_name, results, output_dir):
         'frequency_count', 'all_variants',
     ]
 
+    kept = 0
+    dropped = 0
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in results:
             row = dict(r)
-            row['suggested_title'] = _generate_title(r, tool_name)
+            title = _generate_title(r, tool_name)
+            if title is None:
+                dropped += 1
+                continue
+            row['suggested_title'] = title
             writer.writerow(row)
+            kept += 1
 
+    if dropped:
+        print(f"  Quality gate: dropped {dropped}, kept {kept}")
     return path
 
 
 def _generate_title(result, tool_name):
-    """Generate a suggested tutorial title."""
+    """Convert any keyword into a proper 'How to X in [Tool]' tutorial title."""
     canonical = result['canonical_keyword']
     cat = result['category']
+    tool_cap = _capitalize_tool(tool_name)
 
-    if canonical.lower().startswith('how to'):
+    # Already a how-to — just clean it up
+    if canonical.lower().startswith(('how to ', 'how do ', 'how can ')):
         title = canonical
-        title = re.sub(re.escape(tool_name.lower()), tool_name, title, flags=re.IGNORECASE)
+        title = re.sub(re.escape(tool_name), tool_cap, title, flags=re.IGNORECASE)
         words = title.split()
         if words:
             words[0] = 'How'
-        return ' '.join(words)
+            if len(words) > 1:
+                words[1] = words[1].lower()
+        title = ' '.join(words)
+        title = _fix_known_tool_names(title)
+        if tool_cap.lower() not in title.lower():
+            title += f" in {tool_cap}"
+        return _clean_title(title)
 
+    # Integration → "How to Integrate [Tool] with [Partner]"
     if cat == 'integration':
-        return canonical
+        partner = _extract_partner(canonical, tool_name)
+        if partner:
+            partner_cap = _capitalize_tool(partner)
+            title = f"How to Integrate {tool_cap} with {partner_cap}"
+            return _clean_title(_fix_known_tool_names(title))
+        return None
 
-    return canonical
+    # Other/tutorial — try to extract an action and object
+    return _convert_to_howto(canonical, tool_name, tool_cap)
+
+
+def _capitalize_tool(name):
+    """Proper-case a tool name."""
+    special = {
+        'capcut': 'CapCut', 'docker': 'Docker', 'kubernetes': 'Kubernetes',
+        'midjourney': 'Midjourney', 'terraform': 'Terraform', 'asana': 'Asana',
+        'github': 'GitHub', 'gitlab': 'GitLab', 'hubspot': 'HubSpot',
+        'salesforce': 'Salesforce', 'netsuite': 'NetSuite', 'jira': 'Jira',
+        'slack': 'Slack', 'trello': 'Trello', 'notion': 'Notion',
+        'airtable': 'Airtable', 'clickup': 'ClickUp', 'monday.com': 'Monday.com',
+        'zendesk': 'Zendesk', 'servicenow': 'ServiceNow', 'confluence': 'Confluence',
+        'bitbucket': 'Bitbucket', 'datadog': 'Datadog', 'pagerduty': 'PagerDuty',
+        'figma': 'Figma', 'zapier': 'Zapier', 'miro': 'Miro',
+        'power bi': 'Power BI', 'sharepoint': 'SharePoint', 'outlook': 'Outlook',
+        'gmail': 'Gmail', 'google drive': 'Google Drive', 'dropbox': 'Dropbox',
+        'postgresql': 'PostgreSQL', 'mysql': 'MySQL', 'mongodb': 'MongoDB',
+        'redis': 'Redis', 'nginx': 'NGINX', 'jenkins': 'Jenkins',
+        'ansible': 'Ansible', 'prometheus': 'Prometheus', 'grafana': 'Grafana',
+        'elasticsearch': 'Elasticsearch', 'aws': 'AWS', 'azure': 'Azure',
+        'gcp': 'GCP', 'heroku': 'Heroku', 'vercel': 'Vercel',
+        'tiktok': 'TikTok', 'instagram': 'Instagram', 'youtube': 'YouTube',
+        'linkedin': 'LinkedIn', 'facebook': 'Facebook', 'whatsapp': 'WhatsApp',
+        'discord': 'Discord', 'reddit': 'Reddit',
+        'quickbooks': 'QuickBooks', 'xero': 'Xero', 'stripe': 'Stripe',
+        'shopify': 'Shopify', 'woocommerce': 'WooCommerce',
+        'mailchimp': 'Mailchimp', 'sendgrid': 'SendGrid',
+        'okta': 'Okta', 'auth0': 'Auth0',
+        'n8n': 'n8n', 'ollama': 'Ollama',
+    }
+    return special.get(name.lower(), name.title())
+
+
+def _clean_title(title):
+    """Final cleanup: remove trailing punctuation, fix spacing."""
+    title = title.rstrip('?.!,;:').strip()
+    title = re.sub(r'\s+', ' ', title)
+    return title
+
+
+def _fix_known_tool_names(title):
+    """Fix casing of known tool/product names wherever they appear in a title."""
+    known = {
+        'jira': 'Jira', 'slack': 'Slack', 'trello': 'Trello', 'notion': 'Notion',
+        'asana': 'Asana', 'github': 'GitHub', 'gitlab': 'GitLab',
+        'hubspot': 'HubSpot', 'salesforce': 'Salesforce', 'netsuite': 'NetSuite',
+        'zendesk': 'Zendesk', 'confluence': 'Confluence', 'bitbucket': 'Bitbucket',
+        'servicenow': 'ServiceNow', 'monday.com': 'Monday.com',
+        'clickup': 'ClickUp', 'airtable': 'Airtable', 'figma': 'Figma',
+        'zapier': 'Zapier', 'miro': 'Miro', 'docker': 'Docker',
+        'kubernetes': 'Kubernetes', 'terraform': 'Terraform',
+        'capcut': 'CapCut', 'midjourney': 'Midjourney',
+        'google calendar': 'Google Calendar', 'google drive': 'Google Drive',
+        'google sheets': 'Google Sheets', 'google docs': 'Google Docs',
+        'gmail': 'Gmail', 'outlook': 'Outlook', 'teams': 'Teams',
+        'sharepoint': 'SharePoint', 'excel': 'Excel',
+        'power bi': 'Power BI', 'power automate': 'Power Automate',
+        'tiktok': 'TikTok', 'instagram': 'Instagram', 'youtube': 'YouTube',
+        'linkedin': 'LinkedIn', 'facebook': 'Facebook', 'whatsapp': 'WhatsApp',
+        'discord': 'Discord', 'reddit': 'Reddit',
+        'postgresql': 'PostgreSQL', 'mysql': 'MySQL', 'mongodb': 'MongoDB',
+        'redis': 'Redis', 'nginx': 'NGINX', 'jenkins': 'Jenkins',
+        'ansible': 'Ansible', 'prometheus': 'Prometheus', 'grafana': 'Grafana',
+        'aws': 'AWS', 'azure': 'Azure', 'gcp': 'GCP',
+        'quickbooks': 'QuickBooks', 'xero': 'Xero', 'stripe': 'Stripe',
+        'shopify': 'Shopify', 'mailchimp': 'Mailchimp',
+        'okta': 'Okta', 'datadog': 'Datadog', 'pagerduty': 'PagerDuty',
+        'todoist': 'Todoist', 'dropbox': 'Dropbox', 'ubuntu': 'Ubuntu',
+        'centos': 'CentOS', 'ollama': 'Ollama', 'n8n': 'n8n',
+        'chatgpt': 'ChatGPT', 'openai': 'OpenAI',
+        'smartsheet': 'Smartsheet', 'clockify': 'Clockify',
+        'wrike': 'Wrike', 'basecamp': 'Basecamp', 'evernote': 'Evernote',
+        'harvest': 'Harvest', 'pipedrive': 'Pipedrive', 'zoho': 'Zoho',
+        'freshdesk': 'Freshdesk', 'freshservice': 'Freshservice',
+        'intercom': 'Intercom', 'hootsuite': 'Hootsuite',
+        'microsoft': 'Microsoft', 'claude': 'Claude', 'copilot': 'Copilot',
+    }
+    for lower_name, proper in sorted(known.items(), key=lambda x: -len(x[0])):
+        title = re.sub(r'\b' + re.escape(lower_name) + r'\b', proper, title, flags=re.IGNORECASE)
+    return title
+
+
+def _extract_partner(kw, tool_name):
+    """Extract the integration partner name from a keyword."""
+    kw_lower = kw.lower()
+    tool_lower = tool_name.lower()
+    tool_variants = _tool_name_variants(tool_lower)
+
+    cleaned = kw_lower
+    for variant in sorted(tool_variants, key=len, reverse=True):
+        cleaned = re.sub(r'\b' + re.escape(variant) + r'\b', ' ', cleaned)
+
+    # Use word-boundary removal to avoid mangling tool names
+    remove_words = [
+        'integration', 'integrate', 'integrated', 'integrating',
+        'connect', 'connected', 'connecting', 'connection', 'connector',
+        'sync', 'synced', 'syncing', 'synchronize',
+        'how to', 'how do i', 'how can i',
+        'with', 'to', 'from', 'and', 'for', 'the', 'an', 'in', 'on',
+        'using', 'via', 'through', 'between', 'not working', 'best', 'free',
+        'official', 'documentation', 'guide', 'setup', 'steps',
+        'webhook', 'rest api', 'api', 'plugin', 'app', 'marketplace',
+        'cannot', "can't",
+    ]
+    for word in sorted(remove_words, key=len, reverse=True):
+        cleaned = re.sub(r'\b' + re.escape(word) + r'\b', ' ', cleaned)
+
+    cleaned = ' '.join(cleaned.split()).strip()
+
+    words = [w.strip().strip('?.,!') for w in cleaned.split() if w.strip()]
+    words = [w for w in words if len(w) > 1 and w not in {'of', 'at', 'by', 'if', 'is', 'or', 'a'}]
+
+    partner = ' '.join(words).strip()
+    return partner if partner else None
+
+
+def _convert_to_howto(kw, tool_name, tool_cap):
+    """Attempt to convert a raw keyword into how-to format."""
+    kw_lower = kw.lower().strip()
+    tool_lower = tool_name.lower()
+
+    # Remove tool name
+    cleaned = kw_lower
+    for variant in sorted(_tool_name_variants(tool_lower), key=len, reverse=True):
+        cleaned = cleaned.replace(variant, ' ')
+    cleaned = ' '.join(cleaned.split()).strip()
+
+    # Remove generic noise words
+    for noise in ['tutorial', 'guide', 'step by step', 'for beginners',
+                  'basics', 'advanced', 'complete', 'full']:
+        cleaned = cleaned.replace(noise, ' ')
+    cleaned = ' '.join(cleaned.split()).strip()
+
+    if not cleaned or len(cleaned) < 3:
+        return None
+
+    # Try to identify an action verb at the start
+    words = cleaned.split()
+    canonical_verbs = set(VERB_SYNONYMS.values())
+    all_verb_forms = set(VERB_SYNONYMS.keys()) | canonical_verbs
+
+    if words[0] in all_verb_forms:
+        action = words[0]
+        obj = ' '.join(words[1:]) if len(words) > 1 else ''
+        if obj:
+            title = f"How to {action.title()} {obj.title()} in {tool_cap}"
+        else:
+            title = f"How to {action.title()} in {tool_cap}"
+        return _fix_known_tool_names(title)
+
+    # No action verb found — treat the whole thing as a noun/object
+    title = f"How to Use {cleaned.title()} in {tool_cap}"
+    return _fix_known_tool_names(title)
 
 
 # ── AI Cleanup (optional) ───────────────────────────────────────────────────
